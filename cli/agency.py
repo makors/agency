@@ -347,6 +347,10 @@ def cmd_status(args):
     if battery:
         say(f"  battery    {battery}")
     say(f"  backups    {backup_status()}")
+    sessions = read_agents()
+    if sessions:
+        counts = [f"{sum(e['state'] == s for e in sessions)} {s}" for s in AGENT_STATES if any(e["state"] == s for e in sessions)]
+        say(f"  agents     {', '.join(counts)} (agency agents)")
     names = secret_names()
     say(f"  secrets    {', '.join(names) if names else 'none'}")
 
@@ -1277,6 +1281,202 @@ def cmd_setup_repo(args):
 # ---------------------------------------------------------------- main ---
 
 
+# -------------------------------------------------------------- agents ---
+#
+# What each agent session on this machine is doing, for `agency agents`, the
+# dashboard and the status screen. Claude Code and Codex report through hooks
+# (modules/agents-status.nix) that run `agency agents hook <tool>`; anything
+# else can report with `agency agents set`. One JSON file per session, in
+# AGENTS_DIR. Keep the reading side in step with agent_sessions() in
+# dashboard/server.py.
+
+AGENTS_DIR = Path.home() / ".local/state/agency/agents"
+AGENT_STATES = ("working", "waiting", "idle")
+# A session no hook has heard from in this long is left out: its process
+# is gone or it never said it ended. Sessions set by hand last longer.
+HOOK_STALE = 12 * 3600
+SET_STALE = 24 * 3600
+SHELLS = {"sh", "bash", "dash", "zsh", "fish", "env", "timeout", "nice", "agency", "python3", "python"}
+# Tools that put a question to the person rather than doing work.
+ASKING_TOOLS = {"AskUserQuestion", "request_user_input", "request_user_input_async"}
+
+
+def proc_start(pid):
+    """When a process started (clock ticks since boot), or None if it is gone.
+    Stored with the pid so a reused pid is not mistaken for the session."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return int(stat[stat.rindex(")") + 2:].split()[19])
+
+
+def agent_process():
+    """The agent's own process: the nearest ancestor that is not a shell or
+    this command, since hooks run as `sh -c 'agency agents hook ...'`."""
+    pid = os.getppid()
+    for _ in range(8):
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+        if comm not in SHELLS:
+            return pid
+        pid = int(stat[stat.rindex(")") + 2:].split()[1])
+        if pid <= 1:
+            return None
+    return None
+
+
+def agent_file(tool_name, session):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{tool_name}-{session}")[:120]
+    return AGENTS_DIR / f"{safe}.json"
+
+
+def write_agent(path, entry):
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entry))
+    tmp.replace(path)
+
+
+def read_agents():
+    """Sessions that are still there, oldest first. Drops the files of
+    sessions whose process has ended or that went quiet long ago."""
+    now = time.time()
+    out = []
+    for path in sorted(AGENTS_DIR.glob("*.json")) if AGENTS_DIR.is_dir() else []:
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        pid = entry.get("pid")
+        gone = pid and proc_start(pid) != entry.get("start")
+        stale = now - entry.get("updated", 0) > (HOOK_STALE if pid else SET_STALE)
+        if gone or stale:
+            path.unlink(missing_ok=True)
+            continue
+        out.append(entry)
+    return sorted(out, key=lambda e: e.get("began", 0))
+
+
+def hook_state(event, data):
+    """The state a hook event puts a session in: working, waiting, idle,
+    None to leave it as it is, or "end"."""
+    tool_name = data.get("tool_name") or ""
+    if event == "SessionEnd":
+        return "end"
+    if event in ("Stop", "SessionStart"):
+        return "idle"
+    if event == "PermissionRequest":
+        return "waiting"
+    if event == "PreToolUse":
+        return "waiting" if tool_name in ASKING_TOOLS else "working"
+    if event in ("UserPromptSubmit", "PostToolUse"):
+        return "working"
+    if event == "Notification":
+        kind = data.get("notification_type") or ""
+        if kind == "idle_prompt":
+            return "idle"
+        if kind in ("permission_prompt", "elicitation_dialog") or "permission" in (data.get("message") or "").lower():
+            return "waiting"
+    return None
+
+
+def hook_activity(data):
+    """A short line on what the session is doing: a tool and its stated
+    purpose. Never a prompt, a command line or file contents."""
+    tool_name = data.get("tool_name")
+    if not tool_name:
+        return None
+    inputs = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    why = str(inputs.get("description") or "").strip().splitlines()
+    return f"{tool_name}: {why[0][:80]}" if why else tool_name
+
+
+def agents_hook(tool_name):
+    """Called by an agent's hooks with the event as JSON on stdin. Silent,
+    and never fails the agent: any problem just leaves the state alone."""
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+        session = str(data.get("session_id") or "")
+        state = hook_state(data.get("hook_event_name") or "", data)
+        if not session or state is None:
+            return
+        path = agent_file(tool_name, session)
+        if state == "end":
+            path.unlink(missing_ok=True)
+            return
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            pid = agent_process()
+            entry = {"tool": tool_name, "session": session, "pid": pid,
+                     "start": proc_start(pid) if pid else None, "began": time.time()}
+        now = time.time()
+        if entry.get("state") != state:
+            entry["since"] = now
+        entry.update(state=state, updated=now)
+        if data.get("cwd"):
+            entry["cwd"] = data["cwd"]
+        activity = hook_activity(data)
+        if state == "working" and activity:
+            entry["activity"] = activity
+        elif state == "idle":
+            entry.pop("activity", None)
+        write_agent(path, entry)
+    except Exception:  # noqa: BLE001 - a status hook must never break the agent
+        pass
+
+
+def for_how_long(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("min", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)} {unit}"
+    return "<1 min"
+
+
+def cmd_agents(args):
+    if args.action == "hook":
+        agents_hook(args.name or "agent")
+        return
+    if args.action == "set":
+        if not args.name or args.state not in AGENT_STATES:
+            die(f"usage: agency agents set NAME {{{','.join(AGENT_STATES)}}} [NOTE]")
+        path = agent_file(args.name, "set")
+        now = time.time()
+        try:
+            entry = json.loads(path.read_text())
+        except (OSError, ValueError):
+            entry = {"tool": args.name, "session": "set", "began": now}
+        if entry.get("state") != args.state:
+            entry["since"] = now
+        entry.update(state=args.state, updated=now)
+        if args.note is not None:
+            entry["activity"] = args.note[:120]
+        write_agent(path, entry)
+        return
+    if args.action == "clear":
+        if not args.name:
+            die("usage: agency agents clear NAME")
+        agent_file(args.name, "set").unlink(missing_ok=True)
+        return
+    entries = read_agents()
+    if args.json:
+        print(json.dumps(entries))
+        return
+    if not entries:
+        say("No agent sessions. Claude Code and Codex sessions show up here on their own;")
+        say("anything else can report with: agency agents set NAME working|waiting|idle [NOTE]")
+        return
+    now = time.time()
+    for e in entries:
+        where = Path(e["cwd"]).name if e.get("cwd") else ""
+        parts = [f"{e['tool']:<12}", f"{e['state']:<8}", f"{for_how_long(now - e.get('since', now)):<8}", where, e.get("activity", "")]
+        say("  " + " ".join(p for p in parts if p).rstrip())
+
+
 def main():
     if os.geteuid() == 0:
         # Run as the agent account so files in /etc/nixos stay theirs.
@@ -1332,6 +1532,13 @@ def main():
     p.add_argument("--from", dest="source", metavar="WHEN", help="with restore: latest (default), a snapshot ID, or an age like 2h or 3d")
     p.add_argument("--to", metavar="DEST", help="with restore: where to put it (default: its own place if it is gone, else next to it)")
 
+    p = sub.add_parser("agents", help="what the agent sessions on this machine are doing")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "set", "clear", "hook"])
+    p.add_argument("name", nargs="?", help="with set or clear: the agent's name; with hook: claude or codex")
+    p.add_argument("state", nargs="?", help="with set: working, waiting or idle")
+    p.add_argument("note", nargs="?", help="with set: a short line on what it is doing")
+    p.add_argument("--json", action="store_true", help="list as JSON")
+
     sub.add_parser("recovery-key", help="show the disk recovery key once, then delete it")
     sub.add_parser("setup-repo", help=argparse.SUPPRESS)
     sub.add_parser("help", help="show this help")
@@ -1357,12 +1564,13 @@ def main():
         "export": cmd_export,
         "import": cmd_import,
         "backup": cmd_backup,
+        "agents": cmd_agents,
         "recovery-key": cmd_recovery_key,
         "setup-repo": cmd_setup_repo,
     }
     handlers[args.command](args)
     if args.command is None:
-        say("\nCommands: update, rebuild, rollback, channel, apps, desktop, secret, backup, export, import, recovery-key. See: agency help")
+        say("\nCommands: update, rebuild, rollback, channel, apps, desktop, agents, secret, backup, export, import, recovery-key. See: agency help")
 
 
 if __name__ == "__main__":

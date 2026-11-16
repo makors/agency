@@ -46,6 +46,39 @@ function drawDesktops(list) {
   }
 }
 
+// Agents: one row per session, the ones waiting for a person first.
+
+const AGENT_NAMES = { claude: "Claude Code", codex: "Codex" };
+const AGENT_STATE = { working: "Working", waiting: "Waiting for you", idle: "Idle" };
+const AGENT_ORDER = { waiting: 0, working: 1, idle: 2 };
+
+function forHowLong(stamp) {
+  const s = Math.max(0, Date.now() / 1000 - stamp);
+  if (s < 60) return "under a minute";
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  if (s < 86400) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86400)} d`;
+}
+
+function drawAgents(list) {
+  if (!list.length) {
+    setHTML($("#agent-list"), `<p class="row muted">No agent sessions running.</p>`);
+    return;
+  }
+  const rows = [...list].sort((a, b) => AGENT_ORDER[a.state] - AGENT_ORDER[b.state] || a.began - b.began);
+  setHTML($("#agent-list"), rows.map((a) => {
+    const name = AGENT_NAMES[a.tool] || a.tool;
+    const detail = [a.folder && `<span class="mono">${esc(a.folder)}</span>`, a.activity && esc(a.activity)]
+      .filter(Boolean).join(" · ");
+    const old = a.manual && Date.now() / 1000 - a.updated > 3600 ? ` · <span class="muted">last heard ${ago(a.updated)}</span>` : "";
+    return `<div class="row">
+      <div class="row-main"><p class="row-name">${esc(name)}</p>${detail || old ? `<p class="row-detail">${detail}${old}</p>` : ""}</div>
+      <div class="row-end"><span class="agent-state is-${a.state}">${AGENT_STATE[a.state]}</span>
+        <span class="row-detail">${a.since ? forHowLong(a.since) : ""}</span></div>
+    </div>`;
+  }).join(""));
+}
+
 // System: CPU and memory over the last ten minutes, and every disk.
 
 const pct = (n) => `${Math.round(n)}%`;
@@ -202,6 +235,7 @@ function draw(s) {
   // Here only when there is something to do; Settings has the rest.
   drawUpdates(["behind", "unlinked"].includes(s.updates.status) ? s.updates : null, jobRunning);
   drawSystem(s.vitals);
+  drawAgents(s.agents || []);
   drawDesktops(s.desktops);
   drawApps();
   for (const b of document.querySelectorAll("[data-job]")) b.disabled = jobRunning;

@@ -241,6 +241,12 @@ h2 { font: 700 2rem / 1.1 var(--font-display); }
 .on { display: inline-flex; align-items: center; gap: 0.375rem; color: var(--accent-strong); font-size: 0.8125rem; font-weight: 600; }
 .on::before { content: ""; width: 0.5rem; height: 0.5rem; background: var(--accent); }
 .row-end { display: flex; align-items: center; gap: 0.75rem; flex-shrink: 0; }
+.agent-state { display: inline-flex; align-items: center; gap: 0.375rem; font-size: 0.8125rem; font-weight: 600; color: var(--muted); }
+.agent-state::before { content: ""; width: 0.5rem; height: 0.5rem; background: var(--line); }
+.agent-state.is-working { color: var(--accent-strong); }
+.agent-state.is-working::before { background: var(--accent); }
+.agent-state.is-waiting { color: var(--danger); }
+.agent-state.is-waiting::before { background: var(--danger); }
 
 /* ----------------------------------------------------------------- apps */
 

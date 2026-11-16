@@ -34,6 +34,7 @@ in
       ../../modules/secrets.nix # encrypted secrets for agents
       ../../modules/backup.nix # hourly backups of the home folder
       ../../modules/skills.nix # what agent CLIs are told about this machine
+      ../../modules/agent-status.nix # agent CLIs report what they are doing
       ../../modules/dashboard.nix # the web dashboard and terminal, over Tailscale
       ../../modules/screen.nix # the status screen on the laptop's own display
     ];

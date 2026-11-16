@@ -6,7 +6,8 @@ header to every request; the dashboard only answers logins that own this
 machine or are listed in `dashboardUsers` in settings.nix.
 
 /screen, its files and /api/screen need no login. They are what the laptop's
-own display shows (modules/screen.nix) and hold nothing secret.
+own display shows (modules/screen.nix) and hold nothing secret. Of the agent
+sessions the screen gets only counts, not what they are working on.
 
 /settings moves a machine's setup to another one: `agency export` makes an
 encrypted file to download, and an uploaded one goes to `agency import`.
@@ -453,6 +454,63 @@ def recovery_key_present():
     return ok
 
 
+# ---------------------------------------------------------------- agents ---
+# What each agent session is doing, as `agency agents` writes it (one JSON
+# file per session; modules/agent-status.nix). Keep in step with
+# read_agents() in cli/agency.py, which also deletes the files left behind.
+
+AGENTS_DIR = HOME / ".local/state/agency/agents"
+AGENT_STATES = ("working", "waiting", "idle")
+
+
+def proc_start(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return int(stat[stat.rindex(")") + 2:].split()[19])
+
+
+def agent_sessions():
+    """Sessions whose process is still running, or that were set by hand in
+    the last day, oldest first. The folder is shown by its last part only."""
+    now = time.time()
+    out = []
+    for path in AGENTS_DIR.glob("*.json") if AGENTS_DIR.is_dir() else []:
+        try:
+            e = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        pid = e.get("pid")
+        if pid and proc_start(pid) != e.get("start"):
+            continue
+        if now - e.get("updated", 0) > (12 if pid else 24) * 3600:
+            continue
+        if e.get("state") not in AGENT_STATES:
+            continue
+        out.append({
+            "tool": str(e.get("tool", "agent")),
+            "state": e["state"],
+            "since": e.get("since"),
+            "updated": e.get("updated"),
+            "began": e.get("began", 0),
+            "folder": Path(e["cwd"]).name if e.get("cwd") else "",
+            "activity": str(e.get("activity") or ""),
+            "manual": not pid,
+        })
+    return sorted(out, key=lambda e: e["began"])
+
+
+def agents_summary(sessions):
+    """A line for the status screen: '2 working, 1 waiting for you'."""
+    parts = []
+    for state, words in (("working", "working"), ("waiting", "waiting for you"), ("idle", "idle")):
+        n = sum(e["state"] == state for e in sessions)
+        if n:
+            parts.append(f"{n} {words}")
+    return ", ".join(parts) or "None running"
+
+
 def system():
     gen, made = generation()
     return {
@@ -812,6 +870,7 @@ def screen():
         "state": "Starting" if state in ("starting", "initializing") else "Running",
         "tailscale": name,
         "desktops": joined([f":{n}" for n in range(1, desktop_count() + 1)]),
+        "agents": agents_summary(agent_sessions()),
         "system": text,
         "url": url if name else "",
         "qr": qr_cached(url) if name and url else "",
@@ -1151,6 +1210,7 @@ class Handler(BaseHTTPRequestHandler):
                 "state": machine_state(),
                 "tailscale": tailnet_name(),
                 "desktops": desktops(),
+                "agents": agent_sessions(),
                 "accounts": accounts(),
                 "secrets": secrets(),
                 "system": system(),

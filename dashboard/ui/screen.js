@@ -24,6 +24,7 @@ function render(s) {
   $("tailscale").textContent = s.tailscale || "Not connected";
   $("tailscale").classList.toggle("mono", !!s.tailscale);
   $("desktops").textContent = s.desktops;
+  $("agents").textContent = s.agents;
   $("system").textContent = s.system;
   $("foot").textContent = s.console
     ? "To open a console, press Ctrl+Alt+F2."
