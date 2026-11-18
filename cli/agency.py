@@ -1289,6 +1289,163 @@ def cmd_setup_repo(args):
     ensure_repo()
 
 
+# --------------------------------------------------------------- devin ---
+# `agency devin` hands this machine to Devin as its workspace. Devin runs in
+# its own cloud VM, so each session gets two things as session secrets:
+#
+#   AGENCY_SSH_KEY   a fresh ed25519 key made for this session only, allowed
+#                    in ~/.ssh/authorized_keys until `agency devin revoke`
+#   TS_AUTHKEY       an ephemeral Tailscale key (the DEVIN_TAILSCALE_AUTHKEY
+#                    secret), so Devin's VM joins the tailnet and reaches
+#                    this machine by name without opening any port
+#
+# The work then happens here, not in Devin's VM: state, Docker images and
+# checkouts stay between sessions, the hourly backups cover them, and a
+# person can watch on the desktops. See docs/devin.md.
+
+DEVIN_API = "https://api.devin.ai/v1"
+DEVIN_STATE = Path.home() / ".local" / "state" / "agency" / "devin.json"
+DEVIN_KEYS = Path.home() / ".ssh" / "authorized_keys"
+DEVIN_KEY_TAG = "agency-devin"
+
+
+def devin_request(method, path, body=None):
+    import urllib.error
+    import urllib.request
+
+    key = os.environ.get("DEVIN_API_KEY")
+    if not key:
+        die("no Devin API key. Store one with: agency secret set DEVIN_API_KEY")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"{DEVIN_API}{path}",
+        data=data,
+        method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        die(f"Devin answered {e.code}: {e.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as e:
+        die(f"could not reach Devin: {e.reason}")
+
+
+def devin_sessions():
+    try:
+        return json.loads(DEVIN_STATE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def devin_save(sessions):
+    DEVIN_STATE.parent.mkdir(parents=True, exist_ok=True)
+    DEVIN_STATE.write_text(json.dumps(sessions, indent=2) + "\n")
+
+
+def devin_prompt(task, host):
+    return f"""You have a computer of your own for this task: an agency machine,
+a NixOS box set up for AI agents, where you have passwordless sudo. Do the
+work THERE, not in your own VM, so it is still there next session.
+
+Reach it like this:
+1. Install Tailscale and join the tailnet with the TS_AUTHKEY secret:
+   curl -fsSL https://tailscale.com/install.sh | sh
+   sudo tailscale up --authkey "$TS_AUTHKEY" --hostname devin-$RANDOM
+2. Save the AGENCY_SSH_KEY secret to ~/.ssh/agency (mode 600), then:
+   ssh -i ~/.ssh/agency -o StrictHostKeyChecking=accept-new agent@{host}
+3. On the machine, read /etc/nixos/AGENTS.md first. `agency help` lists
+   its commands; `agency backup restore PATH --from 2h` undoes mistakes.
+
+The task:
+{task}
+"""
+
+
+def devin_add_key(session_tag):
+    with tempfile.TemporaryDirectory() as tmp:
+        key = Path(tmp) / "key"
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{DEVIN_KEY_TAG} {session_tag}", "-f", key], capture=True)
+        private, public = key.read_text(), (Path(tmp) / "key.pub").read_text().strip()
+    DEVIN_KEYS.parent.mkdir(mode=0o700, exist_ok=True)
+    with DEVIN_KEYS.open("a") as f:
+        f.write(public + "\n")
+    DEVIN_KEYS.chmod(0o600)
+    return private
+
+
+def devin_remove_key(session_tag):
+    if not DEVIN_KEYS.exists():
+        return False
+    lines = DEVIN_KEYS.read_text().splitlines()
+    kept = [l for l in lines if not l.endswith(f"{DEVIN_KEY_TAG} {session_tag}")]
+    DEVIN_KEYS.write_text("".join(l + "\n" for l in kept))
+    return len(kept) != len(lines)
+
+
+def cmd_devin(args):
+    sessions = devin_sessions()
+
+    if args.action == "run":
+        if not args.task:
+            die('usage: agency devin run "what Devin should do"')
+        ts_key = os.environ.get("DEVIN_TAILSCALE_AUTHKEY")
+        if not ts_key:
+            die("Devin needs an ephemeral Tailscale key to reach this machine.\n"
+                "Make one at https://login.tailscale.com/admin/settings/keys (Ephemeral, Reusable),\n"
+                "then: agency secret set DEVIN_TAILSCALE_AUTHKEY")
+        host = socket.gethostname()
+        tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+        private = devin_add_key(tag)
+        task = " ".join(args.task)
+        body = {
+            "prompt": devin_prompt(task, host),
+            "title": f"agency/{host}: {task[:60]}",
+            "tags": ["agency", host],
+            "session_secrets": [
+                {"key": "AGENCY_SSH_KEY", "value": private, "sensitive": True},
+                {"key": "TS_AUTHKEY", "value": ts_key, "sensitive": True},
+            ],
+        }
+        if args.acu_limit:
+            body["max_acu_limit"] = args.acu_limit
+        try:
+            made = devin_request("POST", "/sessions", body)
+        except SystemExit:
+            devin_remove_key(tag)
+            raise
+        sid = made.get("session_id", "")
+        sessions[sid] = {"tag": tag, "task": task, "url": made.get("url", ""), "started": tag}
+        devin_save(sessions)
+        say(f"Devin is on it: {made.get('url', sid)}")
+        say(f"Its key works until: agency devin revoke {sid}")
+        return
+
+    if args.action == "list":
+        if not sessions:
+            say("No Devin sessions from this machine. Start one: agency devin run \"...\"")
+            return
+        for sid, s in sessions.items():
+            status = devin_request("GET", f"/sessions/{sid}").get("status_enum", "?") if os.environ.get("DEVIN_API_KEY") else "?"
+            say(f"  {sid}  {status:<10} {s['task'][:50]}")
+            say(f"      {s['url']}")
+        return
+
+    if args.action == "revoke":
+        targets = list(sessions) if args.task == ["all"] else args.task
+        if not targets:
+            die("usage: agency devin revoke SESSION_ID|all")
+        for sid in targets:
+            s = sessions.pop(sid, None)
+            if not s:
+                say(f"{sid}: not a session from this machine.")
+                continue
+            removed = devin_remove_key(s["tag"])
+            say(f"{sid}: {'key removed' if removed else 'no key left to remove'}.")
+        devin_save(sessions)
+
+
 # ---------------------------------------------------------------- main ---
 
 
@@ -1347,6 +1504,11 @@ def main():
     p.add_argument("--from", dest="source", metavar="WHEN", help="with restore: latest (default), a snapshot ID, or an age like 2h or 3d")
     p.add_argument("--to", metavar="DEST", help="with restore: where to put it (default: its own place if it is gone, else next to it)")
 
+    p = sub.add_parser("devin", help="give Devin this machine as its workspace: run, list, revoke")
+    p.add_argument("action", nargs="?", default="list", choices=["run", "list", "revoke"])
+    p.add_argument("task", nargs="*", help="with run: what Devin should do; with revoke: session IDs or all")
+    p.add_argument("--acu-limit", type=int, metavar="N", help="with run: stop the session after N ACUs")
+
     sub.add_parser("recovery-key", help="show the disk recovery key once, then delete it")
     sub.add_parser("setup-repo", help=argparse.SUPPRESS)
     sub.add_parser("help", help="show this help")
@@ -1372,12 +1534,13 @@ def main():
         "export": cmd_export,
         "import": cmd_import,
         "backup": cmd_backup,
+        "devin": cmd_devin,
         "recovery-key": cmd_recovery_key,
         "setup-repo": cmd_setup_repo,
     }
     handlers[args.command](args)
     if args.command is None:
-        say("\nCommands: update, rebuild, rollback, channel, apps, desktop, secret, backup, export, import, recovery-key. See: agency help")
+        say("\nCommands: update, rebuild, rollback, channel, apps, desktop, secret, backup, devin, export, import, recovery-key. See: agency help")
 
 
 if __name__ == "__main__":
