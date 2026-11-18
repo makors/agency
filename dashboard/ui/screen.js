@@ -1,4 +1,6 @@
 // The status screen: ask the server what to show, every ten seconds.
+// After `agency screen show URL` that is another page, in a frame over
+// everything, until `agency screen reset`.
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -15,7 +17,25 @@ function fitName() {
   }
 }
 
+// The page from `agency screen show`, or none. Changing it reloads the frame.
+function showPage(url) {
+  let frame = $("show");
+  if (!url) {
+    frame?.remove();
+    return;
+  }
+  if (frame && frame.dataset.url === url) return;
+  frame?.remove();
+  frame = document.createElement("iframe");
+  frame.id = "show";
+  frame.title = "The page chosen with agency screen show";
+  frame.dataset.url = url;
+  frame.src = url;
+  document.body.append(frame);
+}
+
 function render(s) {
+  showPage(s.show);
   if ($("name").textContent !== s.hostname) {
     $("name").textContent = s.hostname;
     document.title = `${s.hostname} - agency`;

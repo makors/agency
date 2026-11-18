@@ -20,6 +20,8 @@ Your home directory is yours: `bun add -g` (use Bun over npm where you can; `npm
 
 `agency apps add|remove <id>` switches optional software (catalog: `apps.nix`).
 
+`agency screen show <url>` puts a web page on the laptop's own display, for example one you serve on `127.0.0.1`; `agency screen reset` brings back the status screen.
+
 When you add an app to the catalog, add its logo as `dashboard/ui/logos/<id>.svg`. Take it from [svgl](https://svgl.app) first (its API blocks scripts, so fetch from `static/library/` in the `pheralb/svgl` GitHub repo), else Simple Icons or the project itself, and note the source in `dashboard/ui/logos/README.md`.
 
 ## Desktops

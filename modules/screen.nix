@@ -8,6 +8,10 @@
 # The page needs no login and shows nothing secret. The browser runs as its
 # own unprivileged account, not as the agent account.
 #
+# `agency screen show URL` puts another page on the display instead, such as
+# one an agent serves on this machine; `agency screen reset` brings the
+# status screen back. No rebuild: the status page shows it in a frame.
+#
 # Ctrl+Alt+F2 switches to a text console; getty runs on tty2 and up.
 {
   lib,

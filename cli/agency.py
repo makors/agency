@@ -35,6 +35,9 @@ SOURCE_REV = Path("/var/lib/agency/source-rev")
 FIRSTBOOT = Path("/var/lib/agency/firstboot")
 FIRSTBOOT_FAILED = Path("/var/lib/agency/firstboot-failed")
 RECOVERY_KEY = Path("/root/luks-recovery-key.txt")
+# The page the laptop's own display shows instead of the status screen
+# (`agency screen show URL`); the dashboard's /screen reads it.
+SCREEN_URL = Path("/var/lib/agency/screen-url")
 
 # Backups (modules/backup.nix).
 BACKUP_UNIT = "restic-backups-home.service"
@@ -713,6 +716,21 @@ def cmd_desktop(args):
         say(f"Removed desktop :{count}.")
 
 
+def cmd_screen(args):
+    if args.action == "show":
+        url = (args.url or "").strip()
+        if not re.match(r"^https?://\S+$", url):
+            die("usage: agency screen show http://...   (an http or https address)")
+        run(["sudo", "tee", SCREEN_URL], stdin=url + "\n", capture=True)
+        say(f"The screen shows {url} within ten seconds. `agency screen reset` brings the status screen back.")
+    elif args.action == "reset":
+        run(["sudo", "rm", "-f", SCREEN_URL])
+        say("The screen shows the status screen again within ten seconds.")
+    else:
+        url = root_read(SCREEN_URL).strip()
+        say(f"The screen shows {url}" if url else "The screen shows the status screen.")
+
+
 def cmd_recovery_key(args):
     if run(["sudo", "test", "-e", RECOVERY_KEY], check=False).returncode != 0:
         say("The recovery key is no longer on this machine. If it is lost, make a new one")
@@ -1347,6 +1365,10 @@ def main():
     p.add_argument("--from", dest="source", metavar="WHEN", help="with restore: latest (default), a snapshot ID, or an age like 2h or 3d")
     p.add_argument("--to", metavar="DEST", help="with restore: where to put it (default: its own place if it is gone, else next to it)")
 
+    p = sub.add_parser("screen", help="show a web page on the laptop's own display, or the status screen")
+    p.add_argument("action", nargs="?", default="status", choices=["status", "show", "reset"])
+    p.add_argument("url", nargs="?", help="with show: the page, e.g. http://127.0.0.1:8080/")
+
     sub.add_parser("recovery-key", help="show the disk recovery key once, then delete it")
     sub.add_parser("setup-repo", help=argparse.SUPPRESS)
     sub.add_parser("help", help="show this help")
@@ -1372,12 +1394,13 @@ def main():
         "export": cmd_export,
         "import": cmd_import,
         "backup": cmd_backup,
+        "screen": cmd_screen,
         "recovery-key": cmd_recovery_key,
         "setup-repo": cmd_setup_repo,
     }
     handlers[args.command](args)
     if args.command is None:
-        say("\nCommands: update, rebuild, rollback, channel, apps, desktop, secret, backup, export, import, recovery-key. See: agency help")
+        say("\nCommands: update, rebuild, rollback, channel, apps, desktop, screen, secret, backup, export, import, recovery-key. See: agency help")
 
 
 if __name__ == "__main__":
